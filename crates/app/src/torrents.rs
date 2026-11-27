@@ -60,6 +60,12 @@ pub struct TorrentSpec {
     /// end, and a player reads it before anything plays).
     #[serde(default = "first_and_last_first")]
     pub ends_first: bool,
+    /// The public tracker list it got last (#1776): that list's stamp
+    /// (`mdm_torrent::public_trackers::Cache::stamp`; 0: none yet). Another list (a newer fetch
+    /// that changed, another address) is added again, which adds only its new trackers; the same
+    /// list never twice. A private torrent records it too: it was looked at, and gets nothing.
+    #[serde(default)]
+    pub public_list: u64,
 }
 
 fn subfolder_by_default() -> bool {
@@ -488,6 +494,123 @@ pub fn refresh_blocklist(
     });
 }
 
+/// The public tracker list (#1776): its last good copy, read from the torrent data folder on
+/// first use (`mdm_torrent::public_trackers::Cache`, the file the command line reads too), and
+/// fetched again with MDM's own downloader in the background: once a day, an hour after a fetch
+/// that failed. A torrent added meanwhile never waits for it: it takes the list as last fetched,
+/// or none yet, and gets the list once it comes (`App::public_list_to_torrents`).
+#[derive(Clone, Default)]
+pub struct PublicTrackers {
+    cache: Arc<Mutex<Option<mdm_torrent::public_trackers::Cache>>>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// A torrent's kept bytes with the public list added (#1776): the one code for a torrent being
+/// added and one already in the list. None when it is private (BEP 27): it never gets them.
+/// Otherwise the bytes (as they were when the list adds nothing) and how many trackers were new.
+/// Each tracker goes through `trackers::allowed` and is added by `trackers::add`
+/// (`mdm_torrent::public_trackers::add_to`): the info dictionary stays byte for byte.
+pub fn with_public_list(torrent: &[u8], list: &[String]) -> Option<(Vec<u8>, usize)> {
+    if mdm_torrent::trackers::private(torrent) {
+        return None;
+    }
+    Some(match mdm_torrent::public_trackers::add_to(torrent, list) {
+        Some(with) => {
+            let added = mdm_torrent::trackers::listed(&with)
+                .len()
+                .saturating_sub(mdm_torrent::trackers::listed(torrent).len());
+            (with, added)
+        }
+        None => (torrent.to_vec(), 0),
+    })
+}
+
+impl PublicTrackers {
+    /// `f` on the cache (read from the data folder the first time) and that folder. None
+    /// without a data folder.
+    fn with<R>(
+        &self,
+        f: impl FnOnce(&mut mdm_torrent::public_trackers::Cache, &Path) -> R,
+    ) -> Option<R> {
+        let dir = state_dir()?;
+        let mut cache = self.cache.lock().unwrap();
+        let cache = cache.get_or_insert_with(|| mdm_torrent::public_trackers::Cache::load(&dir));
+        Some(f(cache, &dir))
+    }
+
+    /// The list last fetched from `url` and its stamp (`Cache::stamp`, what a torrent records
+    /// once it got it); None while there is none. Never waits for a fetch.
+    pub fn current(&self, url: &str) -> Option<(u64, Vec<String>)> {
+        self.with(|c, _| Some((c.stamp(url)?, c.trackers(url).to_vec())))
+            .flatten()
+    }
+
+    /// Fetch the list at `url` when it is due (`Cache::due`: a day after a good fetch, an hour
+    /// after one that failed; another address at once), one fetch at a time, through Options →
+    /// Proxy / Socks, Connection → DNS and the chosen network adapter (`settings::own_net`). The
+    /// try is recorded before it starts, so MDM closed or crashing during it still waits the
+    /// hour, and the last good list stays. While the chosen adapter is disconnected (its kill
+    /// switch), nothing is tried.
+    pub fn refresh(&self, rt: &tokio::runtime::Handle, url: &str) {
+        use std::sync::atomic::Ordering;
+        let url = url.trim().to_owned();
+        let Ok(parsed) = url::Url::parse(&url) else {
+            return;
+        };
+        if !matches!(parsed.scheme(), "http" | "https")
+            || matches!(crate::settings::own_route(), mdm_engine::Route::Down { .. })
+            || self.busy.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let now = unix_now();
+        let due = self.with(|c, dir| {
+            if !c.due(&url, now) {
+                return None;
+            }
+            c.tried(&url, now);
+            if let Err(e) = c.save(dir) {
+                tracing::warn!("public trackers: the list's cache wasn't saved: {e}");
+            }
+            Some(dir.to_owned())
+        });
+        let Some(Some(dir)) = due else {
+            self.busy.store(false, Ordering::SeqCst);
+            return;
+        };
+        let this = self.clone();
+        rt.spawn(async move {
+            let fetched =
+                mdm_torrent::public_trackers::download(&url, &dir, crate::settings::own_net())
+                    .await;
+            match fetched {
+                Ok(body) => {
+                    this.with(|c, dir| match c.fetched(&url, &body, unix_now()) {
+                        Some(n) => {
+                            if let Err(e) = c.save(dir) {
+                                tracing::warn!("public trackers: the list wasn't saved: {e}");
+                            }
+                            tracing::info!("public trackers: {n} from {url}");
+                        }
+                        None => tracing::warn!(
+                            "public trackers: {url} sent no tracker MDM may contact; the last \
+                             list stays"
+                        ),
+                    });
+                }
+                Err(e) => tracing::warn!("public trackers: {url}: {e}; the last list stays"),
+            }
+            this.busy.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
 /// How the torrent session is held to the network adapter as it is (#35, #143): None without
 /// one chosen; else why torrents can't start (it isn't connected).
 pub fn route_bind(route: &mdm_engine::Route) -> Result<Option<mdm_torrent::Bind>, String> {
@@ -561,6 +684,8 @@ pub enum Act {
     Reannounce,
     /// Trackers to add, by address (kept in its .torrent, `torrent_file`).
     AddTrackers(Vec<String>),
+    /// The public tracker list to add (#1776), unless it is private (`with_public_list`).
+    AddPublicList(Vec<String>),
     /// The files to download from now on (indexes into the torrent's list); `pause`: it isn't
     /// running in the list (stopped, or finished and shared), so it is held paused, not left to
     /// fetch the files out of sight.
@@ -582,18 +707,22 @@ pub enum Done {
     Reannounced,
     /// How many trackers were new.
     TrackersAdded(usize),
+    /// The public list: how many of its trackers were new; None: a private torrent, left as it
+    /// is.
+    PublicListAdded(Option<usize>),
     Chosen,
 }
 
 impl Host {
-    pub fn new() -> Self {
-        Host {
+    /// A host whose first session takes `wanted`: Torrent settings as the list was read
+    /// (`Settings::torrent_config`), never the engine's defaults. A magnet link Windows starts
+    /// MDM for is handled at the first frame, before the clock's first `set_config`: a session
+    /// started then took the defaults, the DHT, local discovery, UPnP and incoming connections
+    /// on whatever Torrent settings said, and kept them while it ran.
+    pub fn new(wanted: Option<Config>) -> Self {
+        let host = Host {
             cell: Arc::new(tokio::sync::Mutex::new(None)),
-            wanted: Arc::new(Mutex::new(state_dir().map(|dir| {
-                let mut cfg = Config::new(dir);
-                cfg.require_authorization = true;
-                cfg
-            }))),
+            wanted: Arc::new(Mutex::new(None)),
             running: Arc::new(Mutex::new(None)),
             cap: Arc::new(Mutex::new(None)),
             upload: Arc::new(Mutex::new(None)),
@@ -601,7 +730,9 @@ impl Host {
             outcomes: Arc::new(Mutex::new(Vec::new())),
             deleting: Arc::new(Mutex::new(HashMap::new())),
             initializing: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+        host.set_config(wanted);
+        host
     }
 
     /// Do `act` on `spec`'s torrent, in the background; its outcome comes back through
@@ -657,6 +788,20 @@ impl Host {
                 }
                 Ok(Done::TrackersAdded(added))
             }
+            Act::AddPublicList(list) => {
+                let bytes = read_kept(hash).await?;
+                let Some((with, added)) = with_public_list(&bytes, &list) else {
+                    return Ok(Done::PublicListAdded(None));
+                };
+                if with != bytes {
+                    save_torrent(hash, &with).map_err(|e| e.to_string())?;
+                    // The running session's copy too, as Add trackers does.
+                    if let Some(t) = self.get().filter(|t| t.has(hash)) {
+                        t.readd(hash, &with, false).await.map_err(err)?;
+                    }
+                }
+                Ok(Done::PublicListAdded(Some(added)))
+            }
             Act::Recheck => {
                 let t = self.session(known).await?;
                 let bytes = read_kept(hash).await?;
@@ -684,11 +829,26 @@ impl Host {
                 Ok(Done::Reannounced)
             }
             Act::Choose { files, pause } => {
-                if let Some(t) = self.get() {
+                // A file ticked now whose bytes are in a parts file (or kept in one by the
+                // running storage) has no file yet: it must be made and get them, even on a
+                // finished torrent whose session stopped while idle, so the session is started
+                // for it. Otherwise a stopped session only keeps the choice (Resume uses it).
+                let reopen = chosen_with_parts(
+                    state_dir().map(|d| d.join("session")).as_deref(),
+                    hash,
+                    &files,
+                );
+                let running = match self.get() {
+                    Some(t) => Some(t),
+                    None if reopen => Some(self.session(known).await?),
+                    None => None,
+                };
+                if let Some(t) = running {
                     if !t.has(hash) {
                         let bytes = read_kept(hash).await?;
-                        // Added, it opens every file at its paths, ticked or not: the same
-                        // check and hand-over as Start, before it is added.
+                        // Its ticked files are made (or checked) and handed over as at Start,
+                        // before it is added; a ticked file's bytes in a parts file go into it
+                        // as the engine opens it.
                         prepare_storage(self, spec, dest, protected).await?;
                         t.add(&bytes, &spec.folder, Some(files.clone()), Vec::new(), pause)
                             .await
@@ -698,9 +858,22 @@ impl Host {
                             })?;
                         return Ok(Done::Chosen);
                     }
-                    t.choose(hash, &files.into_iter().collect())
+                    // In the session: librqbit doesn't open its files again when the choice
+                    // changes, so the file is made (checked as at Start) and the torrent opened
+                    // again on it, its pieces kept; what the parts file held goes into it.
+                    if reopen {
+                        prepare_storage(self, spec, dest, protected).await?;
+                    }
+                    t.choose(hash, &files.iter().copied().collect())
                         .await
                         .map_err(err)?;
+                    if reopen {
+                        let bytes = read_kept(hash).await?;
+                        t.readd(hash, &bytes, false).await.map_err(|e| {
+                            revoke_grant(hash);
+                            err(e)
+                        })?;
+                    }
                     if pause {
                         if t.stats(hash).is_ok_and(|s| s.phase == Phase::Finished) {
                             t.remove(hash, false).await.map_err(err)?;
@@ -1248,6 +1421,12 @@ async fn forget_torrent(
                 }
             }
         }
+        // The parts of the pieces its unticked files shared: MDM's own, gone with it.
+        if let Err(e) =
+            mdm_torrent::authorized_storage::remove_parts(&data.join("session"), &spec.hash)
+        {
+            tracing::warn!("torrent {}: its parts files stayed: {e}", spec.hash);
+        }
         // Keep the metadata and rename mapping if deletion failed, for recovery.
         if let Some(file) = file {
             match std::fs::remove_file(file) {
@@ -1305,6 +1484,17 @@ pub struct ShareJob {
     pub spec: TorrentSpec,
     pub dest: PathBuf,
     pub claims: Arc<Vec<(u64, Vec<PathBuf>)>>,
+}
+
+/// Whether one of the files ticked now (`files`) has its bytes in a parts file under `session`
+/// (the torrents' session folder), or is kept in one by the running storage: it has no file
+/// yet, and ticking it must make it.
+fn chosen_with_parts(session: Option<&Path>, hash: &str, files: &[usize]) -> bool {
+    session.is_some_and(|s| {
+        files
+            .iter()
+            .any(|i| mdm_torrent::authorized_storage::has_parts(s, hash, *i))
+    })
 }
 
 /// The engine may not open a torrent's files on the grant it was given for another folder or
@@ -1405,40 +1595,49 @@ async fn prepare_storage_as(
             spec.folder.clone(),
             dest.to_owned(),
         );
+        let wanted = spec.files.clone();
         let result = tokio::task::spawn_blocking(move || {
-            owner2.prepare_consented(&data2, &folder2, &dest2, fresh)
+            owner2.prepare_for(&data2, &folder2, &dest2, fresh, wanted.as_deref())
         })
         .await
         .map_err(|e| e.to_string())?;
         match result {
-            Ok(files) => {
-                let (owner, folder, dest, ledger) = (
+            Ok(prepared) => {
+                let (owner, folder, dest, ledger, wanted) = (
                     owner.clone(),
                     spec.folder.clone(),
                     dest.to_owned(),
                     data.clone(),
+                    spec.files.clone(),
                 );
-                let now = crate::torrent_ownership::identities(&files);
+                let now = crate::torrent_ownership::identities(&prepared.files);
                 let swapped = held()
                     .lock()
                     .unwrap()
                     .insert(spec.hash.clone(), now.clone())
                     .is_some_and(|was| crate::torrent_ownership::swapped(&was, &now));
                 let hash = spec.hash.clone();
-                mdm_torrent::authorized_storage::authorize(
+                mdm_torrent::authorized_storage::authorize_parted(
                     &data.join("session"),
                     &spec.hash,
                     &spec.folder,
-                    files,
+                    prepared,
                     Arc::new(move || {
-                        // A later init (files chosen, re-added) takes new handles: they are
-                        // what the engine holds from then on.
-                        let files = owner.prepare(&ledger, &folder, &dest)?;
-                        held()
-                            .lock()
-                            .unwrap()
-                            .insert(hash.clone(), crate::torrent_ownership::identities(&files));
-                        Ok(files)
+                        // A later init (re-added, restarted after an error) takes new handles:
+                        // they are what the engine holds from then on. Files ticked since are
+                        // prepared again before (`Act::Choose`), with a grant of their own.
+                        let prepared = owner.prepare_for(
+                            &ledger,
+                            &folder,
+                            &dest,
+                            Vec::new(),
+                            wanted.as_deref(),
+                        )?;
+                        held().lock().unwrap().insert(
+                            hash.clone(),
+                            crate::torrent_ownership::identities(&prepared.files),
+                        );
+                        Ok(prepared)
                     }),
                 );
                 return Ok(swapped);
@@ -1688,6 +1887,7 @@ impl Run {
             server: None,
             at_service: None,
             finishing: None,
+            kept: None,
         };
         if *self.stopped.lock().unwrap() {
             s.state = State::Cancelled;
@@ -1907,9 +2107,161 @@ pub fn dest_for(
     }
 }
 
+/// A torrent through a debrid account (#44): the files ticked in Add torrent, `files` (indexes
+/// into `meta.files`), as the service is given them: their paths in the torrent, `/`-separated,
+/// padding files left out (None: all of them); and their total size.
+pub fn remote_choice(
+    meta: &mdm_torrent::Meta,
+    files: Option<&[usize]>,
+) -> (Option<Vec<String>>, u64) {
+    let ticked: Vec<&mdm_torrent::FileEntry> = meta
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| !f.padding && files.is_none_or(|c| c.contains(i)))
+        .map(|(_, f)| f)
+        .collect();
+    let size = ticked.iter().map(|f| f.size).sum();
+    if ticked.len() == meta.files.iter().filter(|f| !f.padding).count() {
+        return (None, size);
+    }
+    let paths = ticked
+        .iter()
+        .map(|f| {
+            f.path
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    (Some(paths), size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session started before the clock's first `set_config` (a magnet link Windows started
+    /// MDM for, handled at the first frame) takes Torrent settings, not the engine's defaults:
+    /// the DHT switched off stays off, and so do local discovery, UPnP and incoming connections.
+    #[test]
+    fn the_first_session_takes_torrent_settings_not_the_engines_defaults() {
+        let mut s = crate::settings::Settings {
+            torrent_dht: false,
+            torrent_lsd: false,
+            torrent_upnp: false,
+            torrent_incoming: false,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let host = Host::new(s.torrent_config(dir.path().to_owned()));
+        let wanted = host.wanted.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            (wanted.dht, wanted.lsd, wanted.upnp, wanted.listen),
+            (false, false, false, false)
+        );
+        assert!(wanted.require_authorization, "as set_config gives it");
+        // Torrent settings that can't be met (the proxy asked, none set): none, so no session
+        // starts around the proxy either.
+        s.torrent_proxy = true;
+        let host = Host::new(s.torrent_config(dir.path().to_owned()));
+        assert!(host.wanted.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_debrid_torrent_is_given_the_ticked_files_paths_and_size() {
+        let file = |p: &str, size, padding| mdm_torrent::FileEntry {
+            path: p.split('/').collect(),
+            size,
+            padding,
+        };
+        let meta = mdm_torrent::Meta {
+            name: "Lab Show".into(),
+            info_hash: "h".into(),
+            files: vec![
+                file("video.mkv", 2 << 20, false),
+                file(".pad/100", 100, true),
+                file("extras/notes.txt", 64 << 10, false),
+            ],
+            piece_length: 1 << 18,
+            torrent: Vec::new(),
+            peers: Vec::new(),
+        };
+        // All ticked (or the dialog's None): all, and no padding in the size.
+        assert_eq!(remote_choice(&meta, None), (None, (2 << 20) + (64 << 10)));
+        assert_eq!(
+            remote_choice(&meta, Some(&[0, 2])),
+            (None, (2 << 20) + (64 << 10))
+        );
+        assert_eq!(
+            remote_choice(&meta, Some(&[2])),
+            (Some(vec!["extras/notes.txt".to_owned()]), 64 << 10)
+        );
+        // A padding file's index never counts.
+        assert_eq!(
+            remote_choice(&meta, Some(&[0, 1])),
+            (Some(vec!["video.mkv".to_owned()]), 2 << 20)
+        );
+    }
+
+    /// #1776: the public list on a torrent's kept bytes, for one being added and one already in
+    /// the list alike: after its own trackers, the info hash the same, refused trackers left out;
+    /// a private one never; a torrent that has them all, as it was. A spec saved before it reads
+    /// as having no list yet.
+    #[test]
+    fn the_public_list_goes_to_public_torrents_only() {
+        let info = |private: bool| {
+            format!(
+                "d6:lengthi5e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaa{}e",
+                if private { "7:privatei1e" } else { "" }
+            )
+        };
+        let torrent = |private: bool| {
+            let own = "http://own.example/announce";
+            format!("d8:announce{}:{own}4:info{}e", own.len(), info(private)).into_bytes()
+        };
+        let list: Vec<String> = [
+            "udp://tracker.opentrackr.org:1337/announce",
+            "https://tracker.example.org/announce",
+            "http://192.168.1.1/announce",
+        ]
+        .map(String::from)
+        .to_vec();
+        let hash = |t: &[u8]| {
+            mdm_torrent::librqbit::torrent_from_bytes(t)
+                .unwrap()
+                .info_hash
+        };
+        let public = torrent(false);
+        let (with, added) = with_public_list(&public, &list).unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(
+            mdm_torrent::trackers::listed(&with),
+            [
+                "http://own.example/announce",
+                "udp://tracker.opentrackr.org:1337/announce",
+                "https://tracker.example.org/announce"
+            ]
+        );
+        assert_eq!(hash(&with), hash(&public));
+        // Again (at the next start, or the same list fetched again): nothing new.
+        assert_eq!(with_public_list(&with, &list), Some((with.clone(), 0)));
+        // A newer list: only its new tracker.
+        let mut newer = list.clone();
+        newer.push("udp://tracker.new.example.org:6969/announce".into());
+        let (again, added) = with_public_list(&with, &newer).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(hash(&again), hash(&public));
+        // Private: never.
+        assert_eq!(with_public_list(&torrent(true), &list), None);
+        assert_eq!(with_public_list(b"not a torrent", &list), None);
+        // A spec saved before #1776 has no list yet.
+        let mut saved = serde_json::to_value(a_spec()).unwrap();
+        saved.as_object_mut().unwrap().remove("public_list");
+        let read: TorrentSpec = serde_json::from_value(saved).unwrap();
+        assert_eq!(read.public_list, 0);
+    }
 
     fn a_spec() -> TorrentSpec {
         TorrentSpec {
@@ -1925,6 +2277,7 @@ mod tests {
             upload_limit: None,
             in_order: false,
             ends_first: true,
+            public_list: 0,
         }
     }
 
@@ -1962,7 +2315,7 @@ mod tests {
     #[tokio::test]
     async fn direct_delete_reserves_hash_and_paths_until_old_metadata_cleanup_finishes() {
         let tmp = tempfile::tempdir().unwrap();
-        let host = Host::new();
+        let host = Host::new(state_dir().map(Config::new));
         let mut spec = a_spec();
         spec.folder = tmp.path().join("output");
         spec.ownership = Some(crate::torrent_ownership::Ownership {
@@ -2016,7 +2369,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("keep.torrent");
         std::fs::write(&file, b"keep metadata").unwrap();
-        let host = Host::new();
+        let host = Host::new(state_dir().map(Config::new));
         let spec = a_spec();
         let name = format!("delete-error-{}", mdm_ipc::random_token());
         host.start_delete(
@@ -2197,6 +2550,23 @@ mod tests {
         session.stop().await;
     }
 
+    /// A file ticked on a torrent out of the session (finished, its session stopped while
+    /// idle, or after MDM starts again) whose bytes are in a parts file needs the session: its
+    /// parts file on the disk says so.
+    #[test]
+    fn a_ticked_file_with_bytes_in_parts_needs_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("session");
+        let hash = "ab".repeat(20);
+        let parts = session.join(format!("{hash}.parts"));
+        std::fs::create_dir_all(&parts).unwrap();
+        std::fs::write(parts.join("3"), b"shared piece").unwrap();
+        assert!(chosen_with_parts(Some(&session), &hash, &[0, 3]));
+        assert!(!chosen_with_parts(Some(&session), &hash, &[0, 1]));
+        assert!(!chosen_with_parts(Some(&session), &"cd".repeat(20), &[3]));
+        assert!(!chosen_with_parts(None, &hash, &[3]));
+    }
+
     /// #357: the ratio the list and the General tab share, and the seeding limit's.
     #[test]
     fn a_torrents_share_ratio() {
@@ -2309,6 +2679,7 @@ mod tests {
             upload_limit: None,
             in_order: false,
             ends_first: true,
+            public_list: 0,
         };
         let off = SharingLimits::default();
         let ratio2 = SharingLimits {

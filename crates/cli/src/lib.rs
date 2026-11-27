@@ -44,11 +44,13 @@ enum Cmd {
         /// Folder to save into (name from the server), or a file path ending in a name.
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
-        /// Maximum connections (1 to 128).
-        #[arg(short, long, default_value_t = Options::default().max_connections,
+        /// Maximum connections (1 to 128). Default: the app's exception for the address's site
+        /// (Options → Connection, #1778), else 8.
+        #[arg(short, long,
               value_parser = clap::value_parser!(u32).range(1..=MAX_CONNECTIONS_UNLOCKED as i64))]
-        connections: u32,
-        /// Extra request header, e.g. "Referer: https://example.com/" (repeatable).
+        connections: Option<u32>,
+        /// Extra request header, e.g. "Referer: https://example.com/" (repeatable). The app's
+        /// site rules for the address (#1778) add theirs to those not given here.
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
         /// The page's address (Referer header), for links that need one or an expired link's renewal.
@@ -151,10 +153,14 @@ enum Cmd {
         #[arg(long, value_parser = parse_proxy)]
         proxy: Option<Proxy>,
     },
-    /// Install (or update) Deno, the JavaScript runtime yt-dlp needs for YouTube's qualities:
-    /// Deno's official build, checked against its release's SHA-256 (64-bit Windows, Linux and
-    /// macOS). yt-dlp is told of it from then on.
-    InstallDeno {
+    /// Install (or update) MDM's own JavaScript runtime, which yt-dlp needs for YouTube's
+    /// qualities: Node.js's newest LTS official build, checked against its release's checksums
+    /// signed by Node.js's releasers (Windows, Linux and macOS). A runtime already on the
+    /// computer (Deno, Node.js 22 or newer, QuickJS, Bun) or one chosen in Helpers is still used
+    /// first. The Deno earlier versions of MDM installed is removed once Node.js is in place.
+    /// `install-deno` is its earlier name.
+    #[command(alias = "install-deno")]
+    InstallJsRuntime {
         /// The proxy for this run, instead of the app's Options → Proxy / Socks: "none", "system"
         /// (the HTTPS_PROXY / HTTP_PROXY / ALL_PROXY variables, else the system's settings), or
         /// an address: http://host:port, https://, socks5://, socks5h:// (the proxy looks the
@@ -164,7 +170,7 @@ enum Cmd {
         #[arg(long, value_parser = parse_proxy)]
         proxy: Option<Proxy>,
     },
-    /// Check MDM's own helpers (yt-dlp, ffmpeg, gallery-dl, Deno) for newer versions now and
+    /// Check MDM's own helpers (yt-dlp, ffmpeg, gallery-dl, Node.js) for newer versions now and
     /// install them, each checked as its first install was, and print their versions. A helper a
     /// download is using is switched to its new version once that download ends. Programs you
     /// chose in Helpers, and the system's, are yours to update.
@@ -241,6 +247,9 @@ enum Cmd {
         /// Put the subtitles into the video file instead of beside it (needs ffmpeg; MP4/MKV).
         #[arg(long)]
         embed_subs: bool,
+        /// Split the video into multiple files based on its chapters (needs ffmpeg).
+        #[arg(long)]
+        split_chapters: bool,
         /// Connections per stream (1 to 128), as `get`'s: MDM's engine downloads the streams
         /// yt-dlp finds (#769), one in pieces (HLS, DASH) this many pieces at once.
         #[arg(short, long, default_value_t = Options::default().max_connections,
@@ -264,10 +273,10 @@ enum Cmd {
         /// The playlist's or channel's address.
         url: String,
         /// The first entry (from 1).
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
         from: u64,
         /// How many entries at most (none: to the end of the list).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         count: Option<u64>,
         /// The proxy for this run, instead of the app's Options → Proxy / Socks: "none", "system"
         /// (the HTTPS_PROXY / HTTP_PROXY / ALL_PROXY variables, else the system's settings), or
@@ -293,11 +302,14 @@ enum Cmd {
         #[arg(short, long, default_value_t = Options::default().max_connections,
               value_parser = clap::value_parser!(u32).range(1..=MAX_CONNECTIONS_UNLOCKED as i64))]
         connections: u32,
+        /// Split each video into multiple files based on its chapters (needs ffmpeg).
+        #[arg(long)]
+        split_chapters: bool,
         /// The first entry (from 1).
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
         from: u64,
         /// How many entries at most (none: to the end of the list).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         count: Option<u64>,
         /// The proxy for this run, instead of the app's Options → Proxy / Socks: "none", "system"
         /// (the HTTPS_PROXY / HTTP_PROXY / ALL_PROXY variables, else the system's settings), or
@@ -434,11 +446,13 @@ enum Cmd {
     Resume {
         /// The `<file>.mdm.json` next to the unfinished download.
         state: PathBuf,
-        /// Maximum connections (1 to 128).
-        #[arg(short, long, default_value_t = Options::default().max_connections,
+        /// Maximum connections (1 to 128). Default: the app's exception for the address's site
+        /// (Options → Connection, #1778), else 8.
+        #[arg(short, long,
               value_parser = clap::value_parser!(u32).range(1..=MAX_CONNECTIONS_UNLOCKED as i64))]
-        connections: u32,
-        /// Extra request header, e.g. "Cookie: id=1" (repeatable).
+        connections: Option<u32>,
+        /// Extra request header, e.g. "Cookie: id=1" (repeatable). The app's site rules for the
+        /// address (#1778) add theirs to those not given here.
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
         /// The page's address (Referer header), for links that need one or an expired link's renewal.
@@ -451,6 +465,22 @@ enum Cmd {
         /// up in the shell's history; "-" reads it from standard input instead.
         #[arg(long = "cookie", alias = "cookies")]
         cookie: Option<String>,
+        /// The finished file must have this hash: hex MD5 / SHA-1 / SHA-256 / SHA-512 / CRC32,
+        /// optionally named ("sha256:…").
+        #[arg(long, value_parser = parse_checksum)]
+        checksum: Option<mdm_engine::verify::Hash>,
+        /// The DNS that looks the names up, instead of the app's Options → Connection → DNS:
+        /// "system"; a service and how to ask it, "cloudflare-https", "quad9-tls",
+        /// "google-plain", "adguard-https", "nextdns-tls"; DNS servers' addresses,
+        /// "9.9.9.9,149.112.112.112"; or a DNS-over-HTTPS address,
+        /// "https://dns.example/dns-query". No falling back to the system's DNS.
+        #[arg(long, value_parser = parse_dns)]
+        dns: Option<mdm_engine::DnsChoice>,
+        /// The network adapter every connection goes through (#35): its name ("Ethernet",
+        /// "wg0") or one of its addresses. When it isn't there or has no address, nothing is
+        /// sent and the download fails.
+        #[arg(long)]
+        adapter: Option<String>,
         /// Continue from the address itself, never through a debrid account (see `get`).
         #[arg(long)]
         direct: bool,
@@ -877,6 +907,54 @@ pub struct Net {
     /// The network adapter by name ("" any), looked for when the command starts.
     pub adapter: String,
     pub torrent_proxy: TorrentProxy,
+    /// Torrent settings' network switches (#40): the DHT turned off there is off here too.
+    pub torrent_net: TorrentNet,
+    /// Torrent settings' public tracker list (#1776), when it is on: `torrent-get` adds it to a
+    /// public torrent as the app does.
+    pub public_trackers: Option<PublicTrackers>,
+    /// Options → Connection's site rules and exceptions (#1778): `get` and `resume` ask a site
+    /// as the app does, where the command line doesn't say otherwise.
+    pub sites: SiteRules,
+}
+
+/// Torrent settings → Network (#40) for `torrent-info` and `torrent-get`'s session, as the app's
+/// takes them: the DHT, finding peers on the local network, UPnP, incoming connections and uTP.
+/// Without the app's settings, all on (the engine's defaults, as the app's own are).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TorrentNet {
+    pub dht: bool,
+    pub lsd: bool,
+    pub upnp: bool,
+    pub listen: bool,
+    pub utp: bool,
+}
+
+impl Default for TorrentNet {
+    fn default() -> Self {
+        TorrentNet {
+            dht: true,
+            lsd: true,
+            upnp: true,
+            listen: true,
+            utp: true,
+        }
+    }
+}
+
+/// The app's site rules and its per-server exceptions (#1778, `mdm_ipc::siterules`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SiteRules {
+    pub rules: Vec<mdm_ipc::siterules::SiteRule>,
+    pub exceptions: Vec<(String, u32)>,
+}
+
+/// The public tracker list the app's Torrent settings turned on (#1776): its address, and the
+/// folder of the cache the app keeps (the app's torrent data folder), which the command line
+/// reads and fetches again when it is due, with MDM's own downloader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicTrackers {
+    pub url: String,
+    pub dir: std::path::PathBuf,
 }
 
 /// Torrent settings' "Use the proxy" (#40), for `torrent-info` and `torrent-get`.
@@ -898,6 +976,9 @@ struct Conn {
     dns: mdm_engine::DnsChoice,
     route: mdm_engine::Route,
     torrent_proxy: TorrentProxy,
+    torrent_net: TorrentNet,
+    public_trackers: Option<PublicTrackers>,
+    sites: SiteRules,
 }
 
 static CONN: std::sync::RwLock<Option<Conn>> = std::sync::RwLock::new(None);
@@ -916,6 +997,12 @@ impl Conn {
                 dns,
                 adapter,
                 ..
+            }
+            | Cmd::Resume {
+                proxy,
+                dns,
+                adapter,
+                ..
             } => (proxy, dns.as_ref(), adapter.as_deref()),
             Cmd::GalleryGet { proxy, adapter, .. } | Cmd::VideoGet { proxy, adapter, .. } => {
                 (proxy, None, adapter.as_deref())
@@ -923,11 +1010,10 @@ impl Conn {
             Cmd::VideoInfo { proxy, .. }
             | Cmd::PlaylistInfo { proxy, .. }
             | Cmd::PlaylistGet { proxy, .. }
-            | Cmd::Resume { proxy, .. }
             | Cmd::InstallYtdlp { proxy }
             | Cmd::InstallFfmpeg { proxy }
             | Cmd::InstallGalleryDl { proxy }
-            | Cmd::InstallDeno { proxy }
+            | Cmd::InstallJsRuntime { proxy }
             | Cmd::UpdateHelpers { proxy } => (proxy, None, None),
             _ => (&None, None, None),
         };
@@ -943,6 +1029,9 @@ impl Conn {
             dns: dns.cloned().unwrap_or_else(|| net.dns.clone()),
             route,
             torrent_proxy: net.torrent_proxy.clone(),
+            torrent_net: net.torrent_net.clone(),
+            public_trackers: net.public_trackers.clone(),
+            sites: net.sites.clone(),
         }
     }
 
@@ -1098,7 +1187,7 @@ fn runs_helpers(cmd: &Cmd) -> bool {
             | Cmd::UpdateHelpers { .. }
             | Cmd::InstallFfmpeg { .. }
             | Cmd::InstallGalleryDl { .. }
-            | Cmd::InstallDeno { .. }
+            | Cmd::InstallJsRuntime { .. }
             | Cmd::GalleryGet { .. }
             | Cmd::VideoInfo { .. }
             | Cmd::PlaylistInfo { .. }
@@ -1157,11 +1246,12 @@ async fn run(cmd: Cmd, json: bool, accounts: Option<&dyn Accounts>) -> anyhow::R
             } else {
                 Destination::File(output)
             };
-            let headers = build_headers(&headers, referer, user_agent, cookie)?;
+            let mut headers = build_headers(&headers, referer, user_agent, cookie)?;
             let opts = Options {
                 checksum,
-                ..opts(connections)
+                ..opts(Options::default().max_connections)
             };
+            let opts = with_site_rules(&conn().sites, &url, connections, &mut headers, opts);
             let opts = through_account(accounts, &url, direct, opts, json).await?;
             let req = Request { url, headers, dest };
             watch(Download::start(req, opts), json).await
@@ -1194,17 +1284,36 @@ async fn run(cmd: Cmd, json: bool, accounts: Option<&dyn Accounts>) -> anyhow::R
             }
             Ok(())
         }
-        Cmd::InstallDeno { .. } => {
+        Cmd::InstallJsRuntime { .. } => {
             let dir = mdm_tools::tools_dir().ok_or_else(|| anyhow::anyhow!("no data folder"))?;
-            let i = mdm_tools::deno::install_latest(&dir, &own_net(), None).await?;
+            let i = mdm_tools::jsruntime::install_latest(&dir, &own_net(), None).await?;
+            // What yt-dlp uses: the one just installed, unless one was chosen or found first.
+            let used = mdm_tools::jsruntime::current(Some(dir.as_path()), None);
             if json {
-                emit(json!({ "tool": "deno", "version": i.version, "path": i.exe }));
+                emit(json!({
+                    "tool": "node",
+                    "version": i.version,
+                    "path": i.exe,
+                    "used": used.as_ref().map(|r| json!({
+                        "runtime": r.kind.ytdlp_name(),
+                        "version": r.version,
+                        "path": r.exe,
+                    })),
+                }));
             } else {
                 println!(
-                    "Deno {} verified and installed: {}",
+                    "Node.js {} verified and installed: {}",
                     i.version,
                     i.exe.display()
                 );
+                if let Some(r) = used.filter(|r| r.exe != i.exe) {
+                    println!(
+                        "yt-dlp uses {} {}, found first: {}",
+                        r.kind.label(),
+                        r.version.as_deref().unwrap_or(""),
+                        r.exe.display()
+                    );
+                }
             }
             Ok(())
         }
@@ -1355,7 +1464,7 @@ async fn run(cmd: Cmd, json: bool, accounts: Option<&dyn Accounts>) -> anyhow::R
             let dir = mdm_tools::tools_dir().ok_or_else(|| anyhow::anyhow!("no data folder"))?;
             let tool = mdm_tools::installed(&dir)
                 .ok_or_else(|| anyhow::anyhow!("yt-dlp is not installed (install-ytdlp)"))?;
-            let to = count.map(|c| from + c.max(1) - 1);
+            let to = count.map(|c| from.saturating_add(c).saturating_sub(1));
             let listing = mdm_tools::playlist::Listing::start(
                 &tool.exe,
                 &url,
@@ -1410,13 +1519,15 @@ async fn run(cmd: Cmd, json: bool, accounts: Option<&dyn Accounts>) -> anyhow::R
             connections,
             from,
             count,
+            split_chapters,
             ..
         } => {
+            mdm_tools::video::set_split_chapters(split_chapters);
             let dir = mdm_tools::tools_dir().ok_or_else(|| anyhow::anyhow!("no data folder"))?;
             let tool = mdm_tools::installed(&dir)
                 .ok_or_else(|| anyhow::anyhow!("yt-dlp is not installed (install-ytdlp)"))?;
             let ffmpeg = mdm_tools::ffmpeg::installed(&dir).map(|f| f.exe);
-            let to = count.map(|c| from + c.max(1) - 1);
+            let to = count.map(|c| from.saturating_add(c).saturating_sub(1));
             let listing = mdm_tools::playlist::Listing::start(
                 &tool.exe,
                 &url,
@@ -1564,8 +1675,9 @@ async fn run(cmd: Cmd, json: bool, accounts: Option<&dyn Accounts>) -> anyhow::R
                 );
             }
             let folder = m.folder_in(&output);
+            let torrent = with_public_list(&m.torrent).await;
             let hash = t
-                .add(&m.torrent, &folder, files, m.peers.clone(), false)
+                .add(&torrent, &folder, files, m.peers.clone(), false)
                 .await?;
             let started = std::time::Instant::now();
             loop {
@@ -1627,9 +1739,11 @@ async fn run(cmd: Cmd, json: bool, accounts: Option<&dyn Accounts>) -> anyhow::R
             subs,
             auto_subs,
             embed_subs,
+            split_chapters,
             connections,
             ..
         } => {
+            mdm_tools::video::set_split_chapters(split_chapters);
             let subs = subs_arg(&subs, auto_subs, embed_subs);
             let dir = mdm_tools::tools_dir().ok_or_else(|| anyhow::anyhow!("no data folder"))?;
             let tool = mdm_tools::installed(&dir)
@@ -1844,19 +1958,28 @@ async fn run(cmd: Cmd, json: bool, accounts: Option<&dyn Accounts>) -> anyhow::R
             referer,
             user_agent,
             cookie,
+            checksum,
             direct,
             ..
         } => {
+            let base_opts = Options {
+                checksum,
+                ..opts(connections.unwrap_or(Options::default().max_connections))
+            };
+            let mut headers = build_headers(&headers, referer, user_agent, cookie)?;
             // Through the account its address goes through (#44): the link a service gave
-            // expires, and the service gives a new one.
+            // expires, and the service gives a new one. The site rules for its address too
+            // (#1778).
             let opts = match mdm_engine::state::ResumeState::load(&state) {
                 Ok(saved) => {
-                    through_account(accounts, &saved.url, direct, opts(connections), json).await?
+                    let sites = conn().sites;
+                    let opts =
+                        with_site_rules(&sites, &saved.url, connections, &mut headers, base_opts);
+                    through_account(accounts, &saved.url, direct, opts, json).await?
                 }
                 // Download::resume says what is wrong with it.
-                Err(_) => opts(connections),
+                Err(_) => base_opts,
             };
-            let headers = build_headers(&headers, referer, user_agent, cookie)?;
             let dl = Download::resume(state, headers, opts)?;
             watch(dl, json).await
         }
@@ -1973,7 +2096,7 @@ fn choice_line(c: &mdm_tools::resolve::Choice) -> String {
     let about = if c.approx { "~" } else { "" };
     let size = c
         .size
-        .map_or(String::new(), |s| format!("  {about}{} MB", s / 1_000_000));
+        .map_or(String::new(), |s| format!("  {about}{}", mb(s)));
     format!("  {}{size}    -f \"{}\"", c.label, c.selector)
 }
 
@@ -2151,6 +2274,52 @@ impl std::error::Error for NoFormat {}
 /// former one once if a site refuses it, #372, and MDM's own name once if a site's bot check
 /// refuses the browser's and the browser-like connection too, #1422; a `--user-agent` or a
 /// `User-Agent` header given is the only one sent), through this command's connection (#1556).
+/// The app's site rules for `url` (#1778) on what the command line gave: its number of
+/// connections (`given`, else the site's exception, else 8), the headers it didn't give, the
+/// rule's User-Agent unless one was given (the user's choice then: no other tried), and the
+/// browser-like connection from the first request.
+fn with_site_rules(
+    sites: &SiteRules,
+    url: &url::Url,
+    given: Option<u32>,
+    headers: &mut HeaderMap,
+    opts: Options,
+) -> Options {
+    let site = mdm_ipc::siterules::for_url(&sites.rules, &sites.exceptions, url);
+    let mut opts = Options {
+        max_connections: given
+            .or(site.connections)
+            .unwrap_or(Options::default().max_connections)
+            .clamp(1, MAX_CONNECTIONS_UNLOCKED),
+        browser_first: site.browser_like,
+        ..opts
+    };
+    let mut agent = site.user_agent;
+    for (name, value) in &site.headers {
+        if name.eq_ignore_ascii_case("user-agent") {
+            agent = agent.or(Some(value.clone()));
+            continue;
+        }
+        let reserved = mdm_ipc::siterules::RESERVED_HEADERS
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(name));
+        if let (false, Ok(n), Ok(v)) = (
+            reserved,
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) && !headers.contains_key(&n)
+        {
+            headers.insert(n, v);
+        }
+    }
+    if let Some(agent) = agent.filter(|_| !headers.contains_key(USER_AGENT)) {
+        opts.speak_as(agent);
+        opts.agent_fallback = None;
+        opts.own_agent = None;
+    }
+    opts
+}
+
 fn opts(connections: u32) -> Options {
     Options {
         max_connections: connections,
@@ -2254,7 +2423,9 @@ fn build_headers_with(
 /// `progress` line per tick, then `done` or `paused`.
 async fn watch(dl: Download, json: bool) -> anyhow::Result<()> {
     let started = Instant::now();
-    let mut last = (Instant::now(), 0u64);
+    // The bytes a resumed download already has are not this run's: the first sample is the
+    // baseline, or they are counted as downloaded in the first half second.
+    let mut last = (Instant::now(), dl.snapshot().downloaded);
     let mut speed = 0.0;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
@@ -2350,25 +2521,81 @@ fn mb(b: u64) -> String {
     format!("{:.2} MB", b as f64 / (1 << 20) as f64)
 }
 
-/// A throwaway torrent session for the command line (its own state folder, nothing kept),
-/// through Torrent settings' SOCKS5 proxy when they say to use it (#1556), as the app's.
+/// A throwaway torrent session for the command line (its own state folder, nothing kept), as
+/// Torrent settings say ([`session_config`]).
 async fn torrents() -> anyhow::Result<(mdm_torrent::Torrents, tempfile::TempDir)> {
-    let proxy = match conn().torrent_proxy {
+    let dir = tempfile::tempdir()?;
+    let t = mdm_torrent::Torrents::start(session_config(&conn(), dir.path().to_owned())?).await?;
+    Ok((t, dir))
+}
+
+/// The command line's torrent session in `dir`: Torrent settings' network switches (the DHT off
+/// there is off here) and their SOCKS5 proxy when they say to use it (#1556), as the app's.
+fn session_config(c: &Conn, dir: std::path::PathBuf) -> anyhow::Result<mdm_torrent::Config> {
+    let proxy = match &c.torrent_proxy {
         TorrentProxy::Off => None,
-        TorrentProxy::Through(p) => Some(p),
+        TorrentProxy::Through(p) => Some(p.clone()),
         TorrentProxy::Missing => anyhow::bail!(
             "Torrent settings say to use the proxy, and Options → Proxy / Socks has no SOCKS5 proxy: set one, or turn Use the proxy off"
         ),
     };
-    let dir = tempfile::tempdir()?;
-    let t = mdm_torrent::Torrents::start(mdm_torrent::Config {
+    let n = &c.torrent_net;
+    Ok(mdm_torrent::Config {
         // Its own folder, nothing of the person's is there: the engine may open what it makes.
         require_authorization: false,
         proxy,
-        ..mdm_torrent::Config::new(dir.path().to_owned())
+        dht: n.dht,
+        lsd: n.lsd,
+        upnp: n.upnp,
+        listen: n.listen,
+        utp: n.utp,
+        ..mdm_torrent::Config::new(dir)
     })
-    .await?;
-    Ok((t, dir))
+}
+
+/// `torrent` with Torrent settings' public tracker list (#1776) when it is on, as the app adds
+/// it to a torrent: from the app's cache, fetched again first (this command's connection, MDM's
+/// downloader) when it is due; never to a private torrent. Said on stderr.
+async fn with_public_list(torrent: &[u8]) -> Vec<u8> {
+    let Some(p) = conn().public_trackers else {
+        return torrent.to_vec();
+    };
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
+    let cache = mdm_torrent::public_trackers::refresh_file(&p.dir, &p.url, now, || {
+        mdm_torrent::public_trackers::download(&p.url, &p.dir, own_net())
+    })
+    .await;
+    let (out, said) = public_list_added(torrent, cache.trackers(&p.url));
+    if let Some(said) = said {
+        eprintln!("{said}");
+    }
+    out
+}
+
+/// [`with_public_list`] once the list is in hand: the bytes, and what to say (nothing when the
+/// list added nothing).
+fn public_list_added(torrent: &[u8], list: &[String]) -> (Vec<u8>, Option<String>) {
+    if mdm_torrent::trackers::private(torrent) {
+        let said = "a private torrent: the public tracker list isn't added";
+        return (
+            torrent.to_vec(),
+            (!list.is_empty()).then(|| said.to_owned()),
+        );
+    }
+    match mdm_torrent::public_trackers::add_to(torrent, list) {
+        Some(with) => {
+            let n = mdm_torrent::trackers::listed(&with)
+                .len()
+                .saturating_sub(mdm_torrent::trackers::listed(torrent).len());
+            let said = format!("{n} tracker(s) added from the public list");
+            (with, Some(said))
+        }
+        None => (torrent.to_vec(), None),
+    }
 }
 
 fn torrent_source(s: &str) -> anyhow::Result<mdm_torrent::Source> {
@@ -2422,6 +2649,142 @@ mod tests {
         assert!(proxy_arg("socks5://", None).is_err());
     }
 
+    /// #1778: `get` and `resume` ask a site as the app does: its rule's headers, User-Agent and
+    /// browser-like connection, its exception's number of connections; what the command line
+    /// gives wins.
+    #[test]
+    fn the_apps_site_rules_apply_where_the_command_line_is_silent() {
+        let sites = SiteRules {
+            rules: vec![mdm_ipc::siterules::SiteRule {
+                site: "*.example.test".into(),
+                user_agent: "Rule/1".into(),
+                browser_like: true,
+                headers: vec![
+                    ("X-Token".into(), "rule".into()),
+                    ("Referer".into(), "https://rule.example.test/".into()),
+                ],
+            }],
+            exceptions: vec![("*.example.test".into(), 2)],
+        };
+        let url: url::Url = "https://dl.example.test/f.bin".parse().unwrap();
+        let mut headers = build_headers_with(
+            &["Referer: https://given.example.test/".to_owned()],
+            None,
+            None,
+            None,
+            std::io::empty(),
+        )
+        .unwrap();
+        let got = with_site_rules(&sites, &url, None, &mut headers, opts(8));
+        assert_eq!(got.max_connections, 2);
+        assert!(got.browser_first);
+        assert_eq!(got.user_agent, "Rule/1");
+        assert_eq!(got.agent_fallback, None);
+        assert_eq!(headers.get("x-token").unwrap(), "rule");
+        assert_eq!(
+            headers.get("referer").unwrap(),
+            "https://given.example.test/"
+        );
+        // Given on the command line: its own.
+        let mut headers =
+            build_headers_with(&[], None, Some("Mine/1".into()), None, std::io::empty()).unwrap();
+        let got = with_site_rules(&sites, &url, Some(16), &mut headers, opts(8));
+        assert_eq!(got.max_connections, 16);
+        assert_eq!(headers.get("user-agent").unwrap(), "Mine/1");
+        assert_ne!(got.user_agent, "Rule/1");
+        // Another site: nothing of the rule's.
+        let mut headers = HeaderMap::new();
+        let other: url::Url = "https://example.org/f.bin".parse().unwrap();
+        let got = with_site_rules(&sites, &other, None, &mut headers, opts(8));
+        assert_eq!(got.max_connections, 8);
+        assert!(!got.browser_first);
+        assert!(headers.is_empty());
+    }
+
+    /// #1776: `torrent-get` adds the public list as the app does: to a public torrent, after its
+    /// own tracker, the hash the same; never to a private one; nothing said when nothing is new.
+    #[test]
+    fn torrent_get_adds_the_public_list_to_public_torrents_only() {
+        let info = |private: bool| {
+            format!(
+                "d6:lengthi5e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaa{}e",
+                if private { "7:privatei1e" } else { "" }
+            )
+        };
+        let torrent = |private: bool| {
+            let own = "http://own.example/announce";
+            format!("d8:announce{}:{own}4:info{}e", own.len(), info(private)).into_bytes()
+        };
+        let list: Vec<String> = [
+            "udp://tracker.opentrackr.org:1337/announce",
+            "http://127.0.0.1:6969/announce",
+        ]
+        .map(String::from)
+        .to_vec();
+        let hash = |t: &[u8]| {
+            mdm_torrent::librqbit::torrent_from_bytes(t)
+                .unwrap()
+                .info_hash
+        };
+        let public = torrent(false);
+        let (out, said) = public_list_added(&public, &list);
+        assert_eq!(
+            mdm_torrent::trackers::listed(&out),
+            [
+                "http://own.example/announce",
+                "udp://tracker.opentrackr.org:1337/announce"
+            ]
+        );
+        assert_eq!(hash(&out), hash(&public));
+        assert_eq!(
+            said.as_deref(),
+            Some("1 tracker(s) added from the public list")
+        );
+        // Again: nothing new, nothing said.
+        assert_eq!(public_list_added(&out, &list), (out.clone(), None));
+        // Private: as it was.
+        let private = torrent(true);
+        let (out, said) = public_list_added(&private, &list);
+        assert_eq!(out, private);
+        assert!(said.unwrap().contains("private"));
+        // No list yet: as it was, nothing said.
+        assert_eq!(public_list_added(&public, &[]), (public.clone(), None));
+        assert_eq!(public_list_added(&private, &[]), (private, None));
+    }
+
+    /// `torrent-info` and `torrent-get` take Torrent settings' network switches: the DHT turned
+    /// off there isn't started here, nor local discovery, UPnP, incoming connections or uTP.
+    #[test]
+    fn the_torrent_commands_take_torrent_settings_switches() {
+        let off = TorrentNet {
+            dht: false,
+            lsd: false,
+            upnp: false,
+            listen: false,
+            utp: false,
+        };
+        let net = Net {
+            torrent_net: off,
+            ..Net::default()
+        };
+        let cmd = Cli::try_parse_from([NAME, "torrent-info", "x.torrent"])
+            .unwrap()
+            .cmd;
+        let dir = std::path::PathBuf::from("state");
+        let c = session_config(&Conn::of(&cmd, &net), dir.clone()).unwrap();
+        assert_eq!(
+            (c.dht, c.lsd, c.upnp, c.listen, c.utp),
+            (false, false, false, false, false)
+        );
+        assert_eq!((c.proxy, c.require_authorization), (None, false));
+        // Without the app's settings: the engine's defaults.
+        let c = session_config(&Conn::of(&cmd, &Net::default()), dir).unwrap();
+        assert_eq!(
+            (c.dht, c.lsd, c.upnp, c.listen, c.utp),
+            (true, true, true, true, true)
+        );
+    }
+
     /// #1556: a command goes through the app's network settings, its own switches over them.
     #[test]
     fn a_command_takes_the_apps_network_and_its_own_switches() {
@@ -2430,6 +2793,9 @@ mod tests {
             dns: parse_dns("quad9-tls").unwrap(),
             adapter: String::new(),
             torrent_proxy: TorrentProxy::Through("socks5://127.0.0.1:1080".into()),
+            torrent_net: TorrentNet::default(),
+            public_trackers: None,
+            sites: SiteRules::default(),
         };
         let cmd = |args: &[&str]| {
             Cli::try_parse_from(std::iter::once(NAME).chain(args.iter().copied()))
@@ -2469,6 +2835,40 @@ mod tests {
             &cmd(&[
                 "get",
                 "http://a.test/f",
+                "--adapter",
+                "no-such-adapter-1556",
+            ]),
+            &net,
+        );
+        assert!(
+            matches!(c.route, mdm_engine::Route::Down { .. }),
+            "{:?}",
+            c.route
+        );
+        let c = Conn::of(&cmd(&["resume", "file.mdm.json"]), &net);
+        assert_eq!(
+            (c.proxy, c.dns, c.route),
+            (net.proxy.clone(), net.dns.clone(), mdm_engine::Route::Any)
+        );
+        let c = Conn::of(
+            &cmd(&[
+                "resume",
+                "file.mdm.json",
+                "--proxy",
+                "none",
+                "--dns",
+                "system",
+            ]),
+            &net,
+        );
+        assert_eq!(
+            (c.proxy, c.dns),
+            (Proxy::None, mdm_engine::DnsChoice::default())
+        );
+        let c = Conn::of(
+            &cmd(&[
+                "resume",
+                "file.mdm.json",
                 "--adapter",
                 "no-such-adapter-1556",
             ]),
@@ -3030,6 +3430,38 @@ mod tests {
                 && user_agent.as_deref() == Some("MyAgent/2.0")
                 && cookie.as_deref() == Some("-")
         ));
+    }
+
+    #[test]
+    fn resume_command_parses_checksum_dns_and_adapter() {
+        let sha256_str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let expected_checksum = parse_checksum(sha256_str).unwrap();
+        let expected_dns = parse_dns("cloudflare-https").unwrap();
+        let cli = Cli::try_parse_from([
+            NAME,
+            "resume",
+            "test.mdm.json",
+            "--checksum",
+            sha256_str,
+            "--dns",
+            "cloudflare-https",
+            "--adapter",
+            "Ethernet",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Resume {
+                checksum: Some(checksum),
+                dns: Some(dns),
+                adapter: Some(adapter),
+                ..
+            } => {
+                assert_eq!(adapter, "Ethernet");
+                assert_eq!(dns, expected_dns);
+                assert_eq!(checksum, expected_checksum);
+            }
+            _ => panic!("expected Cmd::Resume with checksum, dns, and adapter"),
+        }
     }
 
     #[test]
